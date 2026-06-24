@@ -8,6 +8,8 @@ const authState = {
   listeners: new Set(),
 };
 
+let authSubscription = null;
+
 const getUserMeta = (user) => {
   const meta = user?.user_metadata || {};
   return {
@@ -51,7 +53,7 @@ const setSessionUser = async (session) => {
   notifyAuthListeners();
 };
 
-const initAuth = async () => {
+const getCurrentUser = async () => {
   const supabase = window.HaovelsSupabase;
   if (!supabase) {
     authState.ready = true;
@@ -59,14 +61,33 @@ const initAuth = async () => {
     return { ...authState };
   }
 
-  const { data } = await supabase.auth.getSession();
-  await setSessionUser(data?.session || null);
+  const { data, error } = await supabase.auth.getSession();
+  if (error) {
+    console.error('[auth] get session failed:', error.message);
+    await setSessionUser(null);
+    return { ...authState };
+  }
 
-  supabase.auth.onAuthStateChange((_event, session) => {
-    setSessionUser(session);
+  await setSessionUser(data?.session || null);
+  return { ...authState };
+};
+
+const listenAuthChanges = () => {
+  const supabase = window.HaovelsSupabase;
+  if (!supabase || authSubscription) return;
+
+  const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+    setSessionUser(session).catch((err) => {
+      console.error('[auth] state change failed:', err);
+    });
   });
 
-  return { ...authState };
+  authSubscription = data?.subscription || null;
+};
+
+const initAuth = async () => {
+  listenAuthChanges();
+  return getCurrentUser();
 };
 
 const loginWithGoogle = async () => {
@@ -82,7 +103,7 @@ const loginWithGoogle = async () => {
   if (error) throw error;
 };
 
-const logout = async () => {
+const logoutUser = async () => {
   const supabase = window.HaovelsSupabase;
   if (!supabase) return;
   const { error } = await supabase.auth.signOut();
@@ -91,8 +112,11 @@ const logout = async () => {
 
 window.HaovelsAuth = {
   init: initAuth,
+  initAuthListener: listenAuthChanges,
+  getCurrentUser,
   loginWithGoogle,
-  logout,
+  logoutUser,
+  logout: logoutUser,
   onChange(listener) {
     authState.listeners.add(listener);
     listener({ ...authState });
