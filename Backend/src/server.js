@@ -1,332 +1,442 @@
-/**
- * HAOVELS BACKEND — index.js
- *
- * Peran file ini HANYA sebagai orchestrator:
- *   - Jalankan server HTTP
- *   - Kelola cache (memory + disk)
- *   - Jalankan scheduler scraping berkala
- *   - Routing API ke scraper yang tepat (via registry)
- *
- * TIDAK ada logic scraping di sini. Untuk tambah source baru,
- * cukup buat scrapers/<nama>.js lalu daftarkan di scrapers/registry.js.
- *
- * ─── ENDPOINTS ───────────────────────────────────────────────
- *   GET /api/novels              → index ringan semua novel (gabungan semua source)
- *   GET /api/novels/:id          → detail novel (id format: '<source>_<slug>')
- *   GET /api/chapter?url=...     → isi chapter HTML (lazy)
- *   GET /api/health              → status scraper per source
- * ─────────────────────────────────────────────────────────────
- */
-
 'use strict';
 
-const fs   = require('fs');
-const path = require('path');
+const crypto = require('crypto');
+const fs = require('fs/promises');
 const http = require('http');
+const path = require('path');
 const { URL } = require('url');
 
-const { SCRAPERS, scraperForUrl, scraperForId, allSourceIds } = require('./scrapers/registry');
+const { SCRAPERS, scraperForId, scraperForUrl, allSourceIds } = require('./scrapers/registry');
 
-// ─────────────────────────────────────────────────────────────
-// KONFIGURASI
-// ─────────────────────────────────────────────────────────────
-const PORT               = process.env.PORT || 3000;
-const SCRAPE_INTERVAL_MS = Number(process.env.SCRAPE_INTERVAL_MS) || 15 * 60 * 1000;
-const SCRAPE_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 5;
-
-// ─────────────────────────────────────────────────────────────
-// UTIL
-// ─────────────────────────────────────────────────────────────
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-async function runWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
-  let cursor    = 0;
-  async function runNext() {
-    while (cursor < items.length) {
-      const i = cursor++;
-      try   { results[i] = await worker(items[i], i); }
-      catch { results[i] = null; }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
-  return results;
-}
-
-function sortByUpdatedDesc(entries) {
-  return [...entries].sort((a, b) => {
-    const at = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
-    const bt = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
-    return bt - at;
-  });
-}
-
-// ─────────────────────────────────────────────────────────────
-// CACHE (memory + disk)
-// ─────────────────────────────────────────────────────────────
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
+const CHAPTER_CACHE_DIR = path.join(CACHE_DIR, 'chapters');
+const SCRAPE_INTERVAL_MS = Number(process.env.SCRAPE_INTERVAL_MS) || 15 * 60 * 1000;
+const SCRAPE_CONCURRENCY = Math.max(1, Number(process.env.SCRAPE_CONCURRENCY) || 2);
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 60 * 1000;
 
-function loadJson(filename, fallback) {
-  try {
-    const file = path.join(CACHE_DIR, filename);
-    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf-8'));
-  } catch (e) { console.error(`[cache] Baca ${filename} gagal:`, e.message); }
-  return fallback;
-}
-
-function saveJson(filename, data) {
-  try {
-    ensureDir(CACHE_DIR);
-    fs.writeFileSync(path.join(CACHE_DIR, filename), JSON.stringify(data, null, 2), 'utf-8');
-  } catch (e) { console.error(`[cache] Simpan ${filename} gagal:`, e.message); }
-}
-
-// index: { entries: ListEntry[], urlMap: {id: url}, lastScrapedAt }
-// novels: { [id]: NovelDetail }
-// chapters: { [url]: ChapterResult }
-let   indexCache   = loadJson('index.json', null);
-const novelCache   = loadJson('novels.json', {});
-const chapterCache = loadJson('chapters.json', {});
-
-// Status per source untuk /api/health
-const sourceStatus = {};
-allSourceIds().forEach((sid) => {
-  sourceStatus[sid] = {
-    isScraping:          false,
+const state = {
+  index: null,
+  novels: {},
+  urlMap: {},
+  isScrapingIndex: false,
+  startedAt: new Date().toISOString(),
+  lastIndexScrapeAt: null,
+  lastIndexError: null,
+  sources: Object.fromEntries(allSourceIds().map((id) => [id, {
+    ok: true,
     lastScrapeStartedAt: null,
-    lastScrapeFinishedAt:null,
-    lastScrapeError:     null,
-  };
-});
+    lastScrapeFinishedAt: null,
+    lastError: null,
+  }])),
+};
 
-// ─────────────────────────────────────────────────────────────
-// SCHEDULER — scrape penuh berkala dari semua source
-// ─────────────────────────────────────────────────────────────
-let isScrapingGlobal = false;
+const pending = {
+  index: null,
+  details: new Map(),
+  chapters: new Map(),
+};
 
-async function runFullScrapeCycle() {
-  if (isScrapingGlobal) {
-    console.log('[scheduler] Masih berjalan, lewati siklus ini.');
-    return;
-  }
-  isScrapingGlobal = true;
-  console.log('[scheduler] Mulai siklus scraping...');
-
-  const allListEntries = [];   // kumpulan ListEntry dari semua source
-  const urlMap         = {};   // id → url, untuk fallback lazy
-
-  // ── 1. Scrape list dari setiap source ──────────────────────
-  for (const scraper of SCRAPERS) {
-    const sid = scraper.SOURCE_ID;
-    sourceStatus[sid].isScraping          = true;
-    sourceStatus[sid].lastScrapeStartedAt = new Date().toISOString();
-    sourceStatus[sid].lastScrapeError     = null;
-
-    try {
-      const entries = await scraper.scrapeList();
-      entries.forEach((e) => {
-        urlMap[e.id] = e.url;
-        allListEntries.push(e);
-      });
-      console.log(`[${sid}] List selesai: ${entries.length} novel`);
-    } catch (err) {
-      sourceStatus[sid].lastScrapeError = err.message;
-      console.error(`[${sid}] Gagal ambil list:`, err.message);
-    }
-  }
-
-  // ── 2. Scrape detail tiap novel (paralel, dibatasi concurrency) ─
-  let changed = 0, skipped = 0;
-  await runWithConcurrency(allListEntries, SCRAPE_CONCURRENCY, async (entry) => {
-    const sid     = entry.id.split('_')[0];
-    const scraper = SCRAPERS.find((s) => s.SOURCE_ID === sid);
-    if (!scraper) return;
-
-    const cached = novelCache[entry.id];
-    let detail;
-    try {
-      detail = await scraper.scrapeDetail(entry.url);
-    } catch (err) {
-      console.error(`[${sid}] Gagal scrape "${entry.title || entry.id}":`, err.message);
-      if (cached) skipped++;
-      return;
-    }
-
-    const isNew     = !cached;
-    const isChanged = cached && cached.updatedAt !== detail.updatedAt;
-    if (isNew || isChanged) {
-      novelCache[entry.id] = detail;
-      changed++;
-      console.log(`[${sid}] ${isNew ? 'Baru' : 'Update'}: ${detail.title}`);
-    } else {
-      skipped++;
-    }
-  });
-
-  saveJson('novels.json', novelCache);
-
-  // ── 3. Rebuild index dari novelCache ──────────────────────
-  const indexEntries = allListEntries.map((le) => {
-    const d = novelCache[le.id];
-    return {
-      id:        le.id,
-      title:     (d && d.title)  || le.title,
-      cover:     (d && d.cover)  || le.cover,
-      author:    (d && d.author) || le.author,
-      updatedAt: (d && d.updatedAt) || null,
-      source:    le.id.split('_')[0],
-    };
-  });
-
-  indexCache = {
-    entries:      sortByUpdatedDesc(indexEntries),
-    urlMap,
-    lastScrapedAt: new Date().toISOString(),
-  };
-  saveJson('index.json', indexCache);
-
-  // Update status per source
-  allSourceIds().forEach((sid) => {
-    sourceStatus[sid].isScraping           = false;
-    sourceStatus[sid].lastScrapeFinishedAt = indexCache.lastScrapedAt;
-  });
-
-  isScrapingGlobal = false;
-  console.log(`[scheduler] Selesai. ${changed} update, ${skipped} skip, total ${allListEntries.length} novel.`);
-}
-
-// ─────────────────────────────────────────────────────────────
-// FALLBACK LAZY — untuk novel yang belum ada di cache
-// ─────────────────────────────────────────────────────────────
-const pendingDetails  = new Map();
-const pendingChapters = new Map();
-
-async function getNovelDetail(id) {
-  if (novelCache[id]) return novelCache[id];
-  if (pendingDetails.has(id)) return pendingDetails.get(id);
-
-  const promise = (async () => {
-    const url     = indexCache?.urlMap?.[id];
-    const scraper = scraperForId(id);
-    if (!url || !scraper) return null;
-    const detail = await scraper.scrapeDetail(url);
-    novelCache[id] = detail;
-    saveJson('novels.json', novelCache);
-    return detail;
-  })().finally(() => pendingDetails.delete(id));
-
-  pendingDetails.set(id, promise);
-  return promise;
-}
-
-async function getChapterContent(chapterUrl) {
-  if (Object.prototype.hasOwnProperty.call(chapterCache, chapterUrl)) {
-    return chapterCache[chapterUrl];
-  }
-  if (pendingChapters.has(chapterUrl)) return pendingChapters.get(chapterUrl);
-
-  const promise = (async () => {
-    const scraper = scraperForUrl(chapterUrl);
-    if (!scraper) throw new Error(`Tidak ada scraper untuk URL: ${chapterUrl}`);
-    const result = await scraper.scrapeChapter(chapterUrl);
-    chapterCache[chapterUrl] = result;
-    saveJson('chapters.json', chapterCache);
-    return result;
-  })().finally(() => pendingChapters.delete(chapterUrl));
-
-  pendingChapters.set(chapterUrl, promise);
-  return promise;
-}
-
-// ─────────────────────────────────────────────────────────────
-// HTTP SERVER
-// ─────────────────────────────────────────────────────────────
-function sendJson(res, status, data) {
-  res.writeHead(status, {
+function jsonHeaders(extra = {}) {
+  return {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': '*',
-  });
-  res.end(JSON.stringify(data));
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+    'Cache-Control': 'no-store',
+    ...extra,
+  };
 }
 
-const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': '*',
-    });
-    return res.end();
-  }
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, jsonHeaders());
+  res.end(JSON.stringify(payload));
+}
 
-  const reqUrl   = new URL(req.url, `http://${req.headers.host}`);
-  const pathname = reqUrl.pathname;
+function sendError(res, statusCode, message, details = undefined) {
+  sendJson(res, statusCode, {
+    ok: false,
+    error: message,
+    ...(details ? { details } : {}),
+  });
+}
 
+async function ensureCacheDirs() {
+  await fs.mkdir(CHAPTER_CACHE_DIR, { recursive: true });
+}
+
+async function readJsonFile(filePath, fallback) {
   try {
-
-    // ── GET /api/novels ─────────────────────────────────────
-    if (pathname === '/api/novels' && req.method === 'GET') {
-      if (!indexCache) {
-        return sendJson(res, 503, { error: 'Scraper sedang melakukan scrape awal, coba lagi sebentar.' });
-      }
-      return sendJson(res, 200, indexCache.entries);
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.error(`[cache] gagal baca ${path.basename(filePath)}:`, error.message);
     }
-
-    // ── GET /api/novels/:id ─────────────────────────────────
-    const detailMatch = pathname.match(/^\/api\/novels\/([^/]+)$/);
-    if (detailMatch && req.method === 'GET') {
-      const id     = decodeURIComponent(detailMatch[1]);
-      const detail = await getNovelDetail(id);
-      if (!detail) return sendJson(res, 404, { error: 'Novel tidak ditemukan' });
-      return sendJson(res, 200, detail);
-    }
-
-    // ── GET /api/chapter?url=... ────────────────────────────
-    if (pathname === '/api/chapter' && req.method === 'GET') {
-      const chapterUrl = reqUrl.searchParams.get('url');
-      if (!chapterUrl) return sendJson(res, 400, { error: 'Parameter "url" wajib diisi' });
-      const result = await getChapterContent(chapterUrl);
-      return sendJson(res, 200, result);
-    }
-
-    // ── GET /api/health ─────────────────────────────────────
-    if (pathname === '/api/health' && req.method === 'GET') {
-      return sendJson(res, 200, {
-        ok:           true,
-        sources:      allSourceIds(),
-        novelCount:   indexCache ? indexCache.entries.length : 0,
-        lastScrapedAt: indexCache ? indexCache.lastScrapedAt : null,
-        isScraping:   isScrapingGlobal,
-        sourceStatus,
-        scrapeIntervalMs: SCRAPE_INTERVAL_MS,
-      });
-    }
-
-    return sendJson(res, 404, { error: 'Endpoint tidak ditemukan' });
-
-  } catch (err) {
-    console.error('[error]', err.message);
-    return sendJson(res, 500, { error: err.message });
+    return fallback;
   }
+}
+
+async function writeJsonFile(filePath, value) {
+  await ensureCacheDirs();
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const raw = JSON.stringify(value);
+  await fs.writeFile(tempPath, raw, 'utf8');
+  await fs.rename(tempPath, filePath);
+}
+
+function chapterCachePath(chapterUrl) {
+  const key = crypto.createHash('sha1').update(chapterUrl).digest('hex');
+  return path.join(CHAPTER_CACHE_DIR, `${key}.json`);
+}
+
+function normalizeListEntry(entry) {
+  if (!entry || !entry.id || !entry.url) return null;
+  return {
+    id: String(entry.id),
+    title: String(entry.title || 'Untitled').trim() || 'Untitled',
+    cover: entry.cover || '',
+    author: entry.author || '',
+    url: entry.url,
+    source: entry.source || String(entry.id).split('_')[0],
+    updatedAt: entry.updatedAt || null,
+  };
+}
+
+function normalizeDetail(detail, fallback = {}) {
+  if (!detail || typeof detail !== 'object') return null;
+  return {
+    id: detail.id || fallback.id || '',
+    title: detail.title || fallback.title || 'Untitled',
+    cover: detail.cover || fallback.cover || '',
+    author: detail.author || fallback.author || '',
+    artist: detail.artist || '',
+    genres: Array.isArray(detail.genres) ? detail.genres : [],
+    synopsis: detail.synopsis || '',
+    volumes: Array.isArray(detail.volumes) ? detail.volumes : [],
+    updatedAt: detail.updatedAt || null,
+    publishedAt: detail.publishedAt || null,
+    source: detail.source || fallback.source || String(detail.id || fallback.id || '').split('_')[0],
+  };
+}
+
+async function runLimited(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runner() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, runner);
+  await Promise.all(workers);
+  return results;
+}
+
+function sortNewestFirst(entries) {
+  return [...entries].sort((a, b) => {
+    const aTime = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const bTime = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    return bTime - aTime;
+  });
+}
+
+async function loadCache() {
+  await ensureCacheDirs();
+  state.index = await readJsonFile(path.join(CACHE_DIR, 'index.json'), null);
+  state.novels = await readJsonFile(path.join(CACHE_DIR, 'novels.json'), {});
+  state.urlMap = state.index?.urlMap || {};
+  state.lastIndexScrapeAt = state.index?.lastScrapedAt || null;
+}
+
+async function saveIndex(entries, urlMap) {
+  const index = {
+    ok: true,
+    entries: sortNewestFirst(entries),
+    urlMap,
+    lastScrapedAt: new Date().toISOString(),
+  };
+
+  state.index = index;
+  state.urlMap = urlMap;
+  state.lastIndexScrapeAt = index.lastScrapedAt;
+  await writeJsonFile(path.join(CACHE_DIR, 'index.json'), index);
+}
+
+async function saveNovels() {
+  await writeJsonFile(path.join(CACHE_DIR, 'novels.json'), state.novels);
+}
+
+async function scrapeIndex({ force = false } = {}) {
+  if (pending.index) return pending.index;
+  if (!force && state.index?.entries?.length) return state.index;
+
+  pending.index = (async () => {
+    state.isScrapingIndex = true;
+    state.lastIndexError = null;
+
+    const collected = [];
+    const urlMap = {};
+
+    await runLimited(SCRAPERS, SCRAPE_CONCURRENCY, async (scraper) => {
+      const sourceId = scraper.SOURCE_ID;
+      const sourceState = state.sources[sourceId];
+      sourceState.lastScrapeStartedAt = new Date().toISOString();
+      sourceState.lastError = null;
+
+      try {
+        const entries = await scraper.scrapeList();
+        for (const rawEntry of entries || []) {
+          const entry = normalizeListEntry(rawEntry);
+          if (!entry) continue;
+
+          const cachedDetail = state.novels[entry.id];
+          const mergedEntry = {
+            ...entry,
+            title: cachedDetail?.title || entry.title,
+            cover: cachedDetail?.cover || entry.cover,
+            author: cachedDetail?.author || entry.author,
+            updatedAt: cachedDetail?.updatedAt || entry.updatedAt || null,
+          };
+
+          collected.push(mergedEntry);
+          urlMap[entry.id] = entry.url;
+        }
+
+        sourceState.ok = true;
+        sourceState.lastScrapeFinishedAt = new Date().toISOString();
+      } catch (error) {
+        sourceState.ok = false;
+        sourceState.lastError = error.message;
+        sourceState.lastScrapeFinishedAt = new Date().toISOString();
+        console.error(`[${sourceId}] scrape list gagal:`, error.message);
+      }
+    });
+
+    if (!collected.length && state.index?.entries?.length) {
+      state.lastIndexError = 'Scrape index gagal, memakai cache lama.';
+      return state.index;
+    }
+
+    if (!collected.length) {
+      throw new Error('Tidak ada novel yang berhasil diambil dari scraper.');
+    }
+
+    await saveIndex(collected, urlMap);
+    return state.index;
+  })()
+    .catch((error) => {
+      state.lastIndexError = error.message;
+      throw error;
+    })
+    .finally(() => {
+      state.isScrapingIndex = false;
+      pending.index = null;
+    });
+
+  return pending.index;
+}
+
+async function getNovels() {
+  if (state.index?.entries?.length) return state.index.entries;
+  const index = await scrapeIndex();
+  return index.entries || [];
+}
+
+async function getNovelDetail(id) {
+  if (state.novels[id]) return state.novels[id];
+  if (pending.details.has(id)) return pending.details.get(id);
+
+  const promise = (async () => {
+    const scraper = scraperForId(id);
+    if (!scraper) return null;
+
+    if (!state.urlMap[id]) {
+      await scrapeIndex({ force: !state.index?.urlMap?.[id] });
+    }
+
+    const novelUrl = state.urlMap[id];
+    const fallback = state.index?.entries?.find((entry) => entry.id === id) || { id };
+    if (!novelUrl) return null;
+
+    const detail = normalizeDetail(await scraper.scrapeDetail(novelUrl), fallback);
+    if (!detail) return null;
+
+    state.novels[id] = detail;
+    await saveNovels();
+    return detail;
+  })().finally(() => pending.details.delete(id));
+
+  pending.details.set(id, promise);
+  return promise;
+}
+
+async function getChapter(chapterUrl) {
+  if (pending.chapters.has(chapterUrl)) return pending.chapters.get(chapterUrl);
+
+  const promise = (async () => {
+    const filePath = chapterCachePath(chapterUrl);
+    const cached = await readJsonFile(filePath, null);
+    if (cached) return cached;
+
+    const scraper = scraperForUrl(chapterUrl);
+    if (!scraper) {
+      throw Object.assign(new Error('Tidak ada scraper yang cocok untuk URL chapter.'), { statusCode: 400 });
+    }
+
+    const result = await scraper.scrapeChapter(chapterUrl);
+    const payload = {
+      ok: true,
+      url: chapterUrl,
+      htmlContent: result?.htmlContent || result?.html || result?.content || '',
+      updatedAt: result?.updatedAt || null,
+      publishedAt: result?.publishedAt || null,
+      cachedAt: new Date().toISOString(),
+    };
+
+    await writeJsonFile(filePath, payload);
+    return payload;
+  })().finally(() => pending.chapters.delete(chapterUrl));
+
+  pending.chapters.set(chapterUrl, promise);
+  return promise;
+}
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error('Request timeout'), { statusCode: 504 })), ms);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function route(req, res) {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, jsonHeaders({ 'Content-Length': '0' }));
+    res.end();
+    return;
+  }
+
+  if (req.method !== 'GET') {
+    sendError(res, 405, 'Method tidak diizinkan.');
+    return;
+  }
+
+  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = requestUrl.pathname.replace(/\/+$/, '') || '/';
+
+  if (pathname === '/api/health') {
+    sendJson(res, 200, {
+      ok: true,
+      service: 'haovels-backend',
+      uptimeSec: Math.round(process.uptime()),
+      startedAt: state.startedAt,
+      port: PORT,
+      sources: state.sources,
+      cache: {
+        novelCount: state.index?.entries?.length || 0,
+        detailCount: Object.keys(state.novels).length,
+        lastIndexScrapeAt: state.lastIndexScrapeAt,
+        lastIndexError: state.lastIndexError,
+        isScrapingIndex: state.isScrapingIndex,
+      },
+      config: {
+        scrapeIntervalMs: SCRAPE_INTERVAL_MS,
+        scrapeConcurrency: SCRAPE_CONCURRENCY,
+      },
+    });
+    return;
+  }
+
+  if (pathname === '/api/novels') {
+    const novels = await getNovels();
+    sendJson(res, 200, novels);
+    return;
+  }
+
+  const detailMatch = pathname.match(/^\/api\/novels\/([^/]+)$/);
+  if (detailMatch) {
+    const id = decodeURIComponent(detailMatch[1]);
+    const detail = await getNovelDetail(id);
+    if (!detail) {
+      sendError(res, 404, 'Novel tidak ditemukan.');
+      return;
+    }
+    sendJson(res, 200, detail);
+    return;
+  }
+
+  if (pathname === '/api/chapter') {
+    const chapterUrl = requestUrl.searchParams.get('url');
+    if (!chapterUrl) {
+      sendError(res, 400, 'Parameter "url" wajib diisi.');
+      return;
+    }
+
+    const chapter = await getChapter(chapterUrl);
+    sendJson(res, 200, chapter);
+    return;
+  }
+
+  sendError(res, 404, 'Endpoint tidak ditemukan.');
+}
+
+const server = http.createServer((req, res) => {
+  withTimeout(route(req, res), REQUEST_TIMEOUT_MS).catch((error) => {
+    console.error('[server]', error.stack || error.message);
+    if (!res.headersSent) {
+      sendError(res, error.statusCode || 500, error.statusCode ? error.message : 'Internal server error.');
+    } else {
+      res.end();
+    }
+  });
 });
 
-server.listen(PORT, () => {
-  console.log(`\n🚀 Haovels Backend berjalan di http://localhost:${PORT}`);
-  console.log(`Sources aktif: ${allSourceIds().join(', ')}`);
-  console.log(`\nEndpoint:`);
-  console.log(`  GET /api/novels           → semua novel (gabungan semua source)`);
-  console.log(`  GET /api/novels/:id       → detail novel (id: '<source>_<slug>')`);
-  console.log(`  GET /api/chapter?url=...  → isi chapter HTML`);
-  console.log(`  GET /api/health           → status scraper`);
-  console.log(`\nCache: ${CACHE_DIR}`);
-  console.log(`Interval: ${Math.round(SCRAPE_INTERVAL_MS / 60000)} menit | Concurrency: ${SCRAPE_CONCURRENCY}\n`);
+server.on('clientError', (_error, socket) => {
+  socket.end([
+    'HTTP/1.1 400 Bad Request',
+    'Content-Type: application/json; charset=utf-8',
+    'Access-Control-Allow-Origin: *',
+    'Access-Control-Allow-Methods: GET, OPTIONS',
+    'Connection: close',
+    '',
+    '{"ok":false,"error":"Bad request"}',
+  ].join('\r\n'));
+});
 
-  runFullScrapeCycle();
-  setInterval(runFullScrapeCycle, SCRAPE_INTERVAL_MS);
+async function bootstrap() {
+  await loadCache();
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[haovels] API berjalan di http://${HOST}:${PORT}`);
+    console.log(`[haovels] sources: ${allSourceIds().join(', ')}`);
+    console.log(`[haovels] cache: ${CACHE_DIR}`);
+    console.log(`[haovels] scrape concurrency: ${SCRAPE_CONCURRENCY}`);
+  });
+
+  scrapeIndex().catch((error) => console.error('[bootstrap] scrape awal gagal:', error.message));
+  setInterval(() => {
+    scrapeIndex({ force: true }).catch((error) => console.error('[scheduler] scrape index gagal:', error.message));
+  }, SCRAPE_INTERVAL_MS).unref();
+}
+
+process.on('SIGTERM', () => {
+  console.log('[haovels] SIGTERM diterima, shutdown...');
+  server.close(() => process.exit(0));
+});
+
+process.on('SIGINT', () => {
+  console.log('[haovels] SIGINT diterima, shutdown...');
+  server.close(() => process.exit(0));
+});
+
+bootstrap().catch((error) => {
+  console.error('[fatal]', error.stack || error.message);
+  process.exit(1);
 });

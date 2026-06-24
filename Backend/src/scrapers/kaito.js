@@ -27,6 +27,8 @@ const LIST_PAGES = [
 const HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 };
 
 const CONTENT_SELECTOR = '.post-body.entry-content';
@@ -39,8 +41,22 @@ function sleep(ms) {
 }
 
 async function fetchHtml(url) {
-  const res = await axios.get(url, { headers: HEADERS, timeout: 20000 });
+  const res = await axios.get(url, {
+    headers: HEADERS,
+    timeout: Number(process.env.SCRAPER_TIMEOUT_MS) || 20000,
+    maxContentLength: 5 * 1024 * 1024,
+    responseType: 'text',
+  });
   return res.data;
+}
+
+function absoluteUrl(href) {
+  if (!href) return '';
+  try {
+    return new URL(href, BASE_URL).toString().split('?')[0].split('#')[0];
+  } catch {
+    return '';
+  }
 }
 
 function directText($, el) {
@@ -65,10 +81,10 @@ function makeId(url) {
 }
 
 function isPostUrl(href) {
-  if (!href) return false;
-  if (!href.includes('zerokaito.blogspot.com')) return false;
-  if (!href.endsWith('.html')) return false;
-  if (href.includes('/p/')) return false;
+  const url = absoluteUrl(href);
+  if (!url.includes('zerokaito.blogspot.com')) return false;
+  if (!url.endsWith('.html')) return false;
+  if (url.includes('/p/')) return false;
   return true;
 }
 
@@ -93,9 +109,8 @@ function parseListPage(html) {
     const tag = el.tagName ? el.tagName.toLowerCase() : '';
 
     if (tag === 'a') {
-      const href = $el.attr('href');
-      if (!isPostUrl(href)) return;
-      const url   = href.split('?')[0].split('#')[0];
+      const url = absoluteUrl($el.attr('href'));
+      if (!isPostUrl(url)) return;
       const title = $el.text().trim();
       const entry = entryFor(url);
       if (title && !entry.title) entry.title = title;
@@ -104,10 +119,9 @@ function parseListPage(html) {
 
     if (tag === 'img') {
       const parentLink = $el.closest('a[href]');
-      const href = parentLink.attr('href');
-      if (!isPostUrl(href)) return;
-      const url = href.split('?')[0].split('#')[0];
-      const src = $el.attr('src') || $el.attr('data-src') || '';
+      const url = absoluteUrl(parentLink.attr('href'));
+      if (!isPostUrl(url)) return;
+      const src = absoluteUrl($el.attr('src') || $el.attr('data-src') || '');
       if (!src) return;
       const entry = entryFor(url);
       if (!entry.cover) entry.cover = src;
@@ -187,7 +201,7 @@ function parseNovelPage(html, novelUrl) {
 
     // Gambar
     if (tag === 'img') {
-      const src = $el.attr('src') || $el.attr('data-src') || '';
+      const src = absoluteUrl($el.attr('src') || $el.attr('data-src') || '');
       if (!src) return;
       if (beforeFirstVolume) { if (!mainCover) mainCover = src; return; }
       if (currentVolume && !currentVolume.cover && currentVolume.chapters.length === 0) {
@@ -198,12 +212,12 @@ function parseNovelPage(html, novelUrl) {
 
     // Link chapter
     if (tag === 'a') {
-      const href     = $el.attr('href');
+      const href     = absoluteUrl($el.attr('href'));
       const linkText = $el.text().trim();
       if (!href || !linkText || !currentVolume) return;
       currentVolume.chapters.push({
         title: linkText,
-        url:   href.split('?')[0].split('#')[0],
+        url:   href,
         order: currentVolume.chapters.length,
       });
     }
